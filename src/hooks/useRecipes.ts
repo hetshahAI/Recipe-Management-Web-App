@@ -14,13 +14,25 @@ export const useRecipes = (searchQuery?: string, page = 1, limit = 12, filters?:
   return useQuery({
     queryKey: ['recipes', searchQuery, page, limit, filters],
     queryFn: async () => {
-      let query = supabase
-        .from('recipes')
-        .select('*')
-        .order('created_at', { ascending: false });
+      // Get current user (may be null for unauthenticated visitors)
+      const { data: { user } } = await supabase.auth.getUser();
+
+      const client: any = (supabase as any);
+      let query: any = client.from('recipes').select('*');
+
+      // If user is signed in, return their recipes + public (user_id IS NULL)
+      if (user) {
+        query = query.or(`user_id.is.null,user_id.eq.${user.id}`);
+      } else {
+        // Unauthenticated visitors only see public recipes
+        query = query.is('user_id', null);
+      }
+
+      query = query.order('created_at', { ascending: false });
 
       if (searchQuery && searchQuery.trim()) {
-        query = query.or(`title.ilike.%${searchQuery}%,cuisine.ilike.%${searchQuery}%`);
+        const term = `%${searchQuery}%`;
+        query = query.or(`title.ilike.${term},cuisine.ilike.${term}`);
       }
 
       // Apply filters
@@ -75,9 +87,13 @@ export const useRecipes = (searchQuery?: string, page = 1, limit = 12, filters?:
       if (error) throw error;
 
       // Get total count for pagination
-      const { count } = await supabase
-        .from('recipes')
-        .select('*', { count: 'exact', head: true });
+      let countQuery: any = client.from('recipes').select('*', { count: 'exact', head: true });
+      if (user) {
+        countQuery = countQuery.or(`user_id.is.null,user_id.eq.${user.id}`);
+      } else {
+        countQuery = countQuery.is('user_id', null);
+      }
+      const { count } = await countQuery;
 
       return {
         recipes: data as Recipe[],
@@ -92,13 +108,19 @@ export const useRecipe = (id: string) => {
   return useQuery({
     queryKey: ['recipe', id],
     queryFn: async () => {
-      const { data, error } = await supabase
-        .from('recipes')
-        .select('*')
-        .eq('id', id)
-        .single();
+      const { data: { user } } = await supabase.auth.getUser();
+
+      const client: any = (supabase as any);
+      let q: any = client.from('recipes').select('*').eq('id', id);
+      const { data, error } = await q.single();
 
       if (error) throw error;
+
+      // Allow public recipes, or owners to access
+      if (data.user_id && (!user || user.id !== data.user_id)) {
+        throw new Error('Not authorized to view this recipe');
+      }
+
       return data as Recipe;
     },
     enabled: !!id,
@@ -111,9 +133,13 @@ export const useCreateRecipe = () => {
 
   return useMutation({
     mutationFn: async (recipeData: CreateRecipeData) => {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) throw new Error('User not authenticated');
+
+      const payload = { ...recipeData, user_id: user.id };
       const { data, error } = await supabase
         .from('recipes')
-        .insert([recipeData])
+        .insert([payload])
         .select()
         .single();
 

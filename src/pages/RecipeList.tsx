@@ -1,6 +1,8 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
+import ThemeToggle from '@/components/ThemeToggle';
+import { supabase } from '@/integrations/supabase/client';
 import { Input } from '@/components/ui/input';
 import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -30,6 +32,22 @@ export const RecipeList = () => {
   });
   
   const { data, isLoading, error } = useRecipes(searchQuery, page, 12, filters);
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    supabase.auth.getUser().then(({ data }) => {
+      if (!mounted) return;
+      setUserEmail(data.user?.email ?? null);
+    });
+    const { data: sub } = supabase.auth.onAuthStateChange((_, session) => {
+      setUserEmail(session?.user?.email ?? null);
+    });
+    return () => {
+      mounted = false;
+      sub?.subscription?.unsubscribe?.();
+    };
+  }, []);
 
   const handleFilterChange = (newFilters: FilterState) => {
     setFilters(newFilters);
@@ -92,6 +110,9 @@ export const RecipeList = () => {
                 Create Your First Recipe
               </Button>
               <AIRecipeGenerator />
+              <div className="hidden sm:block">
+                <ThemeToggle />
+              </div>
             </div>
           </div>
         </div>
@@ -145,6 +166,18 @@ export const RecipeList = () => {
                   Results for "{searchQuery}"
                 </span>
               )}
+            </div>
+            <div className="flex items-center gap-4">
+              {userEmail ? (
+                <div className="text-sm text-muted-foreground">Signed in as <strong>{userEmail}</strong></div>
+              ) : (
+                <div className="text-sm text-muted-foreground">Viewing public recipes</div>
+              )}
+              {userEmail ? (
+                <Button variant="outline" onClick={async () => { await supabase.auth.signOut(); navigate('/', { replace: true }); }}>
+                  Logout
+                </Button>
+              ) : null}
             </div>
           </div>
         )}

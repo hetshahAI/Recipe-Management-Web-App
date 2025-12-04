@@ -1,4 +1,7 @@
+// @ts-nocheck
 import "https://deno.land/x/xhr@0.1.0/mod.ts";
+declare const Deno: any;
+declare function atob(s: string): string;
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.58.0';
 
@@ -14,81 +17,118 @@ serve(async (req) => {
   }
 
   try {
-    const { prompt, cuisine } = await req.json();
+    const body = await req.json();
+    const { prompt, cuisine, image_data } = body;
 
     if (!prompt) {
       throw new Error('Recipe prompt is required');
     }
 
-    const deepseekApiKey = Deno.env.get('OPENAI_API_KEY'); // Using same secret name for DeepSeek key
-    if (!deepseekApiKey) {
-      throw new Error('DeepSeek API key not configured');
+    // Use configurable AI endpoint + key so we don't hardcode a provider here
+    // Support configurable AI endpoint; default to OpenRouter-compatible endpoint if not provided
+    const AI_API_URL = Deno.env.get('AI_API_URL') || 'https://api.openrouter.ai/v1/chat/completions';
+    const AI_API_KEY = Deno.env.get('AI_API_KEY');
+    if (!AI_API_KEY) {
+      throw new Error('AI API key not configured');
     }
 
     console.log('Generating recipe for prompt:', prompt);
 
-    // Call DeepSeek API to generate recipe
-    const response = await fetch('https://api.deepseek.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${deepseekApiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'deepseek-chat',
-        messages: [
-          {
-            role: 'system',
-            content: `You are a professional chef and recipe creator. Generate a complete, detailed recipe based on the user's request. Return ONLY a valid JSON object with this exact structure:
+    const systemPrompt = `You are a professional chef and recipe creator. Generate a complete, detailed recipe based on the user's request. Return ONLY a valid JSON object with exactly the following keys: title (string), description (string), cuisine (string), prep_time (number), cook_time (number), servings (number), difficulty (string), ingredients (array of strings), instructions (array of strings). Do NOT include any extra commentary or markdown.`;
+    const userMessage = `Create a recipe for: ${prompt}${cuisine ? ` (${cuisine} cuisine style)` : ''}`;
 
-{
-  "title": "Recipe Name",
-  "description": "Brief description of the dish",
-  "cuisine": "Cuisine type (e.g., Italian, Mexican, etc.)",
-  "prep_time": 15,
-  "cook_time": 30,
-  "servings": 4,
-  "difficulty": "Easy/Medium/Hard",
-  "ingredients": [
-    "1 cup flour",
-    "2 eggs",
-    "1/2 cup milk"
-  ],
-  "instructions": [
-    "Preheat oven to 350°F",
-    "Mix dry ingredients in a bowl",
-    "Add wet ingredients and stir"
-  ]
-}`
+    // Try the AI request with retries because free keys (OpenRouter) can be flaky
+    let aiJson: any = null;
+    let aiContentRaw: string | undefined = undefined;
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const aiResponse = await fetch(AI_API_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${AI_API_KEY}`,
           },
-          {
-            role: 'user',
-            content: `Create a recipe for: ${prompt}${cuisine ? ` (${cuisine} cuisine style)` : ''}`
-          }
-        ],
-        temperature: 0.7,
-        max_tokens: 1500
-      }),
-    });
+          body: JSON.stringify({
+            model: 'gpt-3.5-turbo',
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userMessage }
+            ],
+            temperature: 0.7,
+            max_tokens: 1500
+          }),
+        });
 
-    if (!response.ok) {
-      const error = await response.text();
-      console.error('DeepSeek API error:', error);
-      throw new Error(`DeepSeek API error: ${error}`);
+        if (!aiResponse.ok) {
+          const err = await aiResponse.text();
+          console.warn(`AI API attempt ${attempt} failed:`, err);
+          // small backoff before retrying
+          if (attempt < maxAttempts) await new Promise((r) => setTimeout(r, 500 * attempt));
+          continue;
+        }
+
+        aiJson = await aiResponse.json();
+        // extract raw content string for parsing/fallback
+        aiContentRaw = aiJson?.choices?.[0]?.message?.content ?? aiJson?.result?.output_text ?? aiJson?.result?.[0]?.content ?? aiJson?.text ?? (typeof aiJson === 'string' ? aiJson : undefined);
+        if (!aiContentRaw) {
+          console.warn('AI returned no text content on attempt', attempt, aiJson);
+          if (attempt < maxAttempts) await new Promise((r) => setTimeout(r, 500 * attempt));
+          continue;
+        }
+
+        break; // success
+      } catch (e) {
+        console.warn(`AI request attempt ${attempt} error:`, e);
+        if (attempt < maxAttempts) await new Promise((r) => setTimeout(r, 500 * attempt));
+      }
     }
 
-    const aiResponse = await response.json();
-    const content = aiResponse.choices[0].message.content.trim();
-    
-    console.log('AI Response:', content);
+    if (!aiJson && !aiContentRaw) {
+      console.error('AI API failed after retries');
+      throw new Error('AI API failed after retries');
+    }
 
-    let recipeData;
+    // OpenRouter may place the assistant text in different keys; support common shapes
+    let content: string | undefined = undefined;
+    if (aiJson?.choices?.[0]?.message?.content) content = aiJson.choices[0].message.content;
+    else if (aiJson?.result?.output_text) content = aiJson.result.output_text;
+    else if (aiJson?.result?.[0]?.content) content = aiJson.result[0].content;
+    else if (typeof aiJson === 'string') content = aiJson;
+    else if (aiJson?.text) content = aiJson.text;
+
+    if (!content) {
+      console.error('AI returned unexpected payload', aiJson);
+      throw new Error('Empty response from AI');
+    }
+
+    let recipeData: any = undefined;
     try {
-      // Try to parse the JSON response
-      recipeData = JSON.parse(content);
+      recipeData = JSON.parse(content.trim());
     } catch (parseError) {
-      console.error('Failed to parse AI response as JSON:', parseError);
-      throw new Error('Invalid response format from AI');
+      // Try to extract JSON object from the text body as a fallback
+      const match = content.match(/\{[\s\S]*\}/);
+      if (match) {
+        try { recipeData = JSON.parse(match[0]); } catch (e) { /* ignore */ }
+      }
+    }
+
+    // If parsing failed, fall back to creating a draft recipe that contains the raw AI output
+    let usedFallback = false;
+    if (!recipeData) {
+      usedFallback = true;
+      const title = (prompt && prompt.length > 0) ? (prompt.slice(0, 60) + (prompt.length > 60 ? '...' : '')) : 'AI Recipe Draft';
+      recipeData = {
+        title: `${title} (AI draft)`,
+        description: `Auto-generated draft. The AI output could not be parsed as structured JSON. Raw output is included in instructions.`,
+        cuisine: cuisine || null,
+        prep_time: null,
+        cook_time: null,
+        servings: null,
+        difficulty: 'Unknown',
+        ingredients: [],
+        instructions: [String(content || aiContentRaw || '').slice(0, 2000)],
+      };
     }
 
     // Initialize Supabase client
@@ -100,6 +140,59 @@ serve(async (req) => {
     }
 
     const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+    // If an image data URL was provided, upload it to Supabase Storage (bucket: 'public')
+    if (image_data) {
+      try {
+        const m = String(image_data).match(/^data:(.+);base64,(.*)$/);
+        if (m) {
+          const mime = m[1];
+          const b64 = m[2];
+          const binary = atob(b64);
+          const len = binary.length;
+          const bytes = new Uint8Array(len);
+          for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+          const ext = (mime.split('/')[1] || 'png').split('+')[0];
+          const filePath = `recipes/${Date.now()}-${Math.random().toString(36).slice(2,8)}.${ext}`;
+          const { data: uploadData, error: uploadErr } = await supabase.storage.from('public').upload(filePath, bytes, { contentType: mime });
+          if (uploadErr) {
+            console.error('Storage upload error:', uploadErr);
+          } else {
+            const { data: urlData } = supabase.storage.from('public').getPublicUrl(filePath);
+            recipeData.image_url = urlData.publicUrl || urlData?.public_url || `/${filePath}`;
+          }
+        } else {
+          // Not a data URL, just store whatever was provided
+          recipeData.image_url = image_data;
+        }
+      } catch (e) {
+        console.error('Error uploading image to storage:', e);
+      }
+    }
+
+    // If an Authorization header with a JWT was provided, try to extract the user id
+    try {
+      const authHeader = req.headers.get('authorization') || req.headers.get('Authorization');
+      if (authHeader && authHeader.toLowerCase().startsWith('bearer ')) {
+        const token = authHeader.split(' ')[1];
+        // decode JWT payload without verifying (we only extract sub)
+        const parts = token.split('.');
+        if (parts.length >= 2) {
+          try {
+            const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+            const userId = payload?.sub || payload?.user_id || payload?.uid;
+            if (userId && !recipeData.user_id) {
+              recipeData.user_id = userId;
+              console.log('Attaching user_id to recipe:', userId);
+            }
+          } catch (e) {
+            console.warn('Failed to decode JWT payload for user attribution', e);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('Error reading Authorization header for user attribution', e);
+    }
 
     // Insert the recipe into the database
     const { data: newRecipe, error: insertError } = await supabase

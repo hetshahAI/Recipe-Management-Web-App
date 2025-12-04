@@ -13,6 +13,8 @@ export const AIRecipeGenerator = () => {
   const [isOpen, setIsOpen] = useState(false);
   const [prompt, setPrompt] = useState('');
   const [selectedCuisine, setSelectedCuisine] = useState('');
+  const [imageData, setImageData] = useState<string | null>(null);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const { toast } = useToast();
   const queryClient = useQueryClient();
@@ -34,38 +36,34 @@ export const AIRecipeGenerator = () => {
 
     setIsGenerating(true);
     try {
-      const { data, error } = await supabase.functions.invoke('generate-recipe', {
-        body: { 
-          prompt: prompt.trim(),
-          cuisine: selectedCuisine 
-        }
-      });
+      // forward the user's access token to the Edge Function so it can tie created recipe to the user if desired
+      const { data: sessionData } = await supabase.auth.getSession();
+      const accessToken = (sessionData as any)?.session?.access_token;
 
+      const invokeOptions: any = {
+        body: { prompt: prompt.trim(), cuisine: selectedCuisine }
+      };
+      if (imageData) invokeOptions.body.image_data = imageData;
+      if (accessToken) invokeOptions.headers = { Authorization: `Bearer ${accessToken}` };
+
+      const { data, error } = await supabase.functions.invoke('generate-recipe', invokeOptions);
       if (error) throw error;
 
-      if (data.success) {
-        toast({
-          title: 'Success!',
-          description: data.message,
-        });
-        
-        // Refresh the recipes list
+      if (data && data.success) {
+        toast({ title: 'Success!', description: data.message });
         queryClient.invalidateQueries({ queryKey: ['recipes'] });
-        
-        // Close dialog and reset form
         setIsOpen(false);
         setPrompt('');
         setSelectedCuisine('');
+        setImageData(null);
       } else {
-        throw new Error(data.error || 'Failed to generate recipe');
+        // If function returned raw payload for debug, include it
+        const raw = data?.raw ? ` — raw: ${String(data.raw).slice(0, 200)}` : '';
+        throw new Error((data && data.error) ? `${data.error}${raw}` : 'Failed to generate recipe');
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error generating recipe:', error);
-      toast({
-        title: 'Error',
-        description: `Failed to generate recipe: ${error.message}`,
-        variant: 'destructive',
-      });
+      toast({ title: 'Error', description: `Failed to generate recipe: ${error.message || String(error)}`, variant: 'destructive' });
     } finally {
       setIsGenerating(false);
     }
@@ -108,6 +106,25 @@ export const AIRecipeGenerator = () => {
                 disabled={isGenerating}
               />
             </div>
+            <div>
+              <label className="block text-sm mb-1">Attach an image (optional)</label>
+              <input
+                type="file"
+                accept="image/*"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  setSelectedFile(file);
+                  const reader = new FileReader();
+                  reader.onload = () => setImageData(String(reader.result));
+                  reader.readAsDataURL(file);
+                }}
+                disabled={isGenerating}
+              />
+              {imageData && (
+                <img src={imageData} alt="preview" className="mt-2 max-h-40 object-contain" />
+              )}
+            </div>
             
             <div>
               <Select 
@@ -146,6 +163,83 @@ export const AIRecipeGenerator = () => {
                 </>
               )}
             </Button>
+            {imageData && (
+              <Button
+                variant="outline"
+                className="w-full mt-2"
+                onClick={async () => {
+                  // image-based generation using local classifier + templates
+                  if (!imageData) return;
+                  setIsGenerating(true);
+                  try {
+                    const classify = (await import('@/lib/imageClassifier')).default;
+                    const getTemplate = (await import('@/lib/recipeTemplates')).default;
+                    const results = await classify(imageData);
+                    if (!results || results.length === 0) {
+                      throw new Error('No labels detected');
+                    }
+                    const top = results[0];
+                    const label = top.label.toLowerCase();
+                    const template = getTemplate(label);
+                    if (!template || Object.keys(template).length === 0) {
+                      throw new Error(`No recipe template for detected label: ${top.label}`);
+                    }
+
+                    // upload the selectedFile (if available) to Supabase Storage
+                    let publicUrl: string | null = null;
+                    if (selectedFile) {
+                      const ext = selectedFile.name.split('.').pop() || 'jpg';
+                      const filePath = `recipes/${Date.now()}-${Math.random().toString(36).slice(2,8)}.${ext}`;
+                      const { data: up, error: upErr } = await supabase.storage.from('public').upload(filePath, selectedFile as File);
+                      if (upErr) console.warn('Storage upload error', upErr);
+                      else {
+                        const { data: urlData } = supabase.storage.from('public').getPublicUrl(filePath);
+                        publicUrl = urlData.publicUrl || (urlData as any).public_url || null;
+                      }
+                    }
+
+                    // build payload from template
+                    const { data: userData } = await supabase.auth.getUser();
+                    const userId = userData?.user?.id ?? null;
+                    const rawDifficulty = template.difficulty || 'easy';
+                    const diff = String(rawDifficulty).toLowerCase();
+                    const allowed = ['easy', 'medium', 'hard'];
+                    const difficulty = allowed.includes(diff) ? diff : 'easy';
+
+                    const recipePayload: any = {
+                      title: template.title || (prompt || 'Image Recipe').slice(0, 100),
+                      description: template.description || '',
+                      cuisine: template.cuisine || selectedCuisine || null,
+                      prep_time: template.prep_time ?? null,
+                      cook_time: template.cook_time ?? null,
+                      servings: template.servings ?? null,
+                      difficulty,
+                      ingredients: template.ingredients || [],
+                      instructions: template.instructions || [],
+                      image_url: publicUrl,
+                    };
+                    if (userId) recipePayload.user_id = userId;
+
+                    const { data: insertData, error: insertErr } = await supabase.from('recipes').insert([recipePayload]).select().single();
+                    if (insertErr) throw insertErr;
+                    queryClient.invalidateQueries({ queryKey: ['recipes'] });
+                    toast({ title: 'Recipe created', description: 'Recipe generated from image' });
+                    setIsOpen(false);
+                    setPrompt('');
+                    setSelectedCuisine('');
+                    setImageData(null);
+                    setSelectedFile(null);
+                  } catch (e: any) {
+                    console.error('Image generation failed', e);
+                    toast({ title: 'Error', description: `Image generation: ${e.message || String(e)}`, variant: 'destructive' });
+                  } finally {
+                    setIsGenerating(false);
+                  }
+                }}
+              >
+                Generate From Image
+              </Button>
+            )}
           </CardContent>
         </Card>
       </DialogContent>
